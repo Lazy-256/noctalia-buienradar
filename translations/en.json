@@ -1,0 +1,12 @@
+{
+  "settings.station_id.label": "Station ID",
+  "settings.station_id.description": "Buienradar measuring station ID (e.g. 6279 = Hoogeveen). 0 picks the station nearest to the coordinates below.",
+  "settings.latitude.label": "Latitude",
+  "settings.latitude.description": "Used for the nearest station and for the rain outlook. Default: Emmen.",
+  "settings.longitude.label": "Longitude",
+  "settings.longitude.description": "Used for the nearest station and for the rain outlook. Default: Emmen.",
+  "settings.page_url.label": "Buienradar page",
+  "settings.page_url.description": "Opened in the default browser by the link at the bottom of the panel. Copy the URL of your place from buienradar.nl.",
+  "settings.refresh_minutes.label": "Refresh interval (minutes)",
+  "settings.refresh_minutes.description": "How often to fetch new data from Buienradar."
+}

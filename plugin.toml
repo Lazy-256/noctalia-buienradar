@@ -1,0 +1,66 @@
+id          = "lazy/buienradar"
+name        = "Buienradar"
+version     = "0.1.0"
+plugin_api  = 32
+author      = "lazy"
+license     = "MIT"
+icon        = "cloud-rain"
+description = "Current weather, 5-day forecast and 2-hour rain outlook from Buienradar.nl"
+tags        = ["weather", "netherlands", "buienradar"]
+
+# Plugin-level settings: shared by the bar widget and the panel.
+[[setting]]
+key             = "station_id"
+type            = "int"
+label_key       = "settings.station_id.label"
+description_key = "settings.station_id.description"
+default         = 0
+min             = 0
+max             = 99999
+
+[[setting]]
+key             = "latitude"
+type            = "double"
+label_key       = "settings.latitude.label"
+description_key = "settings.latitude.description"
+default         = 52.7792
+min             = -90.0
+max             = 90.0
+
+[[setting]]
+key             = "longitude"
+type            = "double"
+label_key       = "settings.longitude.label"
+description_key = "settings.longitude.description"
+default         = 6.9006
+min             = -180.0
+max             = 180.0
+
+[[setting]]
+key             = "page_url"
+type            = "string"
+label_key       = "settings.page_url.label"
+description_key = "settings.page_url.description"
+default         = "https://www.buienradar.nl/weer/emmen/nl/2756136?radarType=rain&radarLocationVariant=NL&radarOffset=8H"
+
+[[setting]]
+key             = "refresh_minutes"
+type            = "int"
+label_key       = "settings.refresh_minutes.label"
+description_key = "settings.refresh_minutes.description"
+default         = 10
+min             = 5
+max             = 60
+
+[[widget]]
+id    = "weather"
+entry = "widget.luau"
+
+[[panel]]
+id                      = "forecast"
+entry                   = "panel.luau"
+width                   = 380
+height                  = 530
+placement               = "floating"
+open_near_click         = true
+dismiss_on_outside_click = true
