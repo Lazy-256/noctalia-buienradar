@@ -1,0 +1,31 @@
+# Python (helper scripts, test tooling)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Lua / Luau build output
+*.luac
+luac.out
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local scratch: screenshots, logs, temporary files
+*.log
+*.tmp
+*.bak
+/scratch/
+/screenshots/
+
+# Local environment and secrets
+.env
+.env.*
