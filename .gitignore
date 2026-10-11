@@ -29,3 +29,6 @@ Thumbs.db
 # Local environment and secrets
 .env
 .env.*
+
+# Claude Code local settings, commands and skills
+.claude/
