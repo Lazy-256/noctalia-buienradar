@@ -1,7 +1,7 @@
 -- Offline smoke test for widget.luau and panel.luau.
 --
 -- Runs both entry scripts under LuaJIT with a mock of the Noctalia runtime and
--- real Buienradar samples (samples/feed.lua, samples/rain.txt).
+-- real samples (samples/feed.lua, samples/rain.txt, samples/geocode.lua, samples/ip.lua).
 --
 --   luajit test/run.lua
 --
@@ -27,27 +27,58 @@ end
 
 local feed = dofile("samples/feed.lua")
 local rain_body = read("samples/rain.txt")
+local geocode = dofile("samples/geocode.lua")
+local ip_answers = dofile("samples/ip.lua")
 
 -- A fixed clock keeps the day/night decision deterministic.
 local NOW = "15:10"
 
+local function url_encode(str)
+  return (tostring(str):gsub("[^%w%-_.~]", function(c) return string.format("%%%02X", c:byte()) end))
+end
+
+local function url_decode(str)
+  return (str:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
+end
+
+-- `settings` is what noctalia.getConfig returns (tests may change it to
+-- simulate a changed setting); `rain_override` replaces the rain outlook body.
 local function make_runtime(settings, rain_override)
-  local rt = { state = {}, watchers = {}, requests = {}, bar = {}, logs = {} }
+  local rt = {
+    settings = settings, state = {}, watchers = {}, requests = {}, hosts = {}, bar = {}, logs = {},
+    now = 10 * 3600 * 1000, ip = "amsterdam", failing = {},
+  }
+
+  local function respond(host, url)
+    if rt.failing[host] then return { ok = false, status = 500, body = "" } end
+    if host == "data.buienradar.nl" then return { ok = true, status = 200, body = "FEED" } end
+    if host == "gpsgadget.buienradar.nl" then return { ok = true, status = 200, body = rain_override or rain_body } end
+    if host == "geocoding-api.open-meteo.com" then
+      local name = url_decode(url:match("[?&]name=([^&]*)") or "")
+      local cc = url_decode(url:match("[?&]countryCode=([^&]*)") or "")
+      return { ok = true, status = 200, body = "GEO:" .. name:lower() .. "|" .. cc:upper() }
+    end
+    if host == "ipwho.is" then return { ok = true, status = 200, body = "IP:" .. rt.ip } end
+    return { ok = false, status = 404, body = "" }
+  end
 
   rt.noctalia = {
     json = {
       decode = function(body)
         if body == "FEED" then return feed end
+        local key = body:match("^GEO:(.*)$")
+        if key then return geocode[key] or { generationtime_ms = 0.1 } end
+        key = body:match("^IP:(.*)$")
+        if key then return ip_answers[key] end
         return nil, "bad json"
       end,
     },
+    string = { urlEncode = url_encode },
     http = function(req, cb)
+      local host = req.url:match("^https?://([^/?]+)")
       rt.requests[#rt.requests + 1] = req.url
-      if req.url:find("data.buienradar.nl", 1, true) then
-        cb({ ok = true, status = 200, body = "FEED" })
-      else
-        cb({ ok = true, status = 200, body = rain_override or rain_body })
-      end
+      rt.hosts[host] = (rt.hosts[host] or 0) + 1
+      cb(respond(host, req.url))
       return true
     end,
     state = {
@@ -69,7 +100,7 @@ local function make_runtime(settings, rain_override)
     log = function(m) rt.logs[#rt.logs + 1] = m end,
     setUpdateInterval = function(ms) rt.interval = ms end,
     togglePanel = function(id) rt.toggled = id end,
-    nowMs = function() return 1234 end,
+    nowMs = function() return rt.now end,
     runAsync = function(cmd) rt.ran = cmd return true end,
   }
 
@@ -80,6 +111,14 @@ local function make_runtime(settings, rain_override)
   }
 
   return rt
+end
+
+-- Last request URL sent to `host` (or nil).
+local function request_to(r, host)
+  for i = #r.requests, 1, -1 do
+    if r.requests[i]:find(host, 1, true) then return r.requests[i] end
+  end
+  return nil
 end
 
 local function load_entry(path, env)
@@ -146,9 +185,10 @@ check(rt.bar.text == "--", "before the first fetch the bar shows a placeholder")
 
 env.update()
 check(rt.interval == 10 * 60 * 1000, "update interval is refresh_minutes in ms")
-check(#rt.requests == 2, "one feed request and one rain request")
-check(rt.requests[2] and rt.requests[2]:find("lat=52.78&lon=6.90", 1, true) ~= nil,
-  "rain request uses two decimals (" .. tostring(rt.requests[2]) .. ")")
+check(#rt.requests == 3 and rt.hosts["geocoding-api.open-meteo.com"] == 1 and rt.hosts["data.buienradar.nl"] == 1
+    and rt.hosts["gpsgadget.buienradar.nl"] == 1, "one geocoder, one feed and one rain request")
+check(request_to(rt, "gpsgadget") and request_to(rt, "gpsgadget"):find("lat=52.78&lon=6.91", 1, true) ~= nil,
+  "rain request uses the place's coordinates with two decimals (" .. tostring(request_to(rt, "gpsgadget")) .. ")")
 
 local d = rt.state.buienradar
 check(type(d) == "table", "snapshot published to state")
@@ -216,6 +256,222 @@ for _, row in ipairs(rt4.bar.tooltip) do if row.value:find("stale", 1, true) the
 check(stale, "tooltip marks stale data")
 
 ---------------------------------------------------------------------------
+-- place resolution, caching, failures and display settings (widget)
+---------------------------------------------------------------------------
+
+-- Settings as a real runtime returns them (defaults filled in), plus overrides.
+local function settings_with(extra)
+  local t = {
+    location_mode = "city", city = "Emmen", country = "NL", latitude = 52.7792, longitude = 6.9006,
+    station_id = 0, page_query = "radarType=rain&radarLocationVariant=NL&radarOffset=8H", page_url = "",
+    refresh_minutes = 10, wind_unit = "bft", bar_text = "temperature",
+  }
+  for k, v in pairs(extra or {}) do t[k] = v end
+  return t
+end
+
+-- (Re)loads the widget script on a runtime, like the shell does after a setting change.
+local function load_widget(r)
+  return load_entry("widget.luau", { noctalia = r.noctalia, barWidget = r.barWidget })
+end
+
+local function widget_for(extra, rain)
+  local r = make_runtime(settings_with(extra), rain)
+  local e = load_widget(r)
+  e.update()
+  return r, e
+end
+
+local function tooltip_value(r, key)
+  for _, row in ipairs(type(r.bar.tooltip) == "table" and r.bar.tooltip or {}) do
+    if row.key == key then return row.value end
+  end
+  return nil
+end
+
+-- 2.2 city resolution
+local emmen = widget_for()
+check(request_to(emmen, "geocoding") ==
+    "https://geocoding-api.open-meteo.com/v1/search?name=Emmen&count=1&language=nl&format=json&countryCode=NL",
+  "geocoder request: name, best match only, Dutch, country code (got " .. tostring(request_to(emmen, "geocoding")) .. ")")
+local ep = emmen.state.buienradar.place
+check(ep.name == "Emmen" and ep.region == "Drenthe" and ep.cc == "NL" and ep.geoid == 2756136
+    and math.abs(ep.lat - 52.78) < 0.01 and math.abs(ep.lon - 6.91) < 0.01 and ep.label == "Emmen, Drenthe",
+  "Emmen/NL resolves to Emmen, Drenthe with its GeoNames id")
+local any_country = widget_for({ city = "Groningen", country = "" })
+check(not request_to(any_country, "geocoding"):find("countryCode", 1, true), "an empty country leaves out countryCode")
+check(any_country.state.buienradar.place.name == "Groningen", "city without a country restriction")
+local hague = widget_for({ city = "The Hague" }).state.buienradar.place
+local denhaag = widget_for({ city = "Den Haag" }).state.buienradar.place
+check(hague.geoid == 2747373 and denhaag.geoid == 2747373 and hague.name == "Den Haag",
+  "'The Hague' and 'Den Haag' resolve to the same place")
+local typo = widget_for({ city = "Emmmen" })
+check(typo.bar.text == "--" and typo.bar.tooltip == "Buienradar: City 'Emmmen' not found" and typo.hosts["data.buienradar.nl"] == nil,
+  "unknown city: reported, no weather fetched for a guessed place (got " .. tostring(typo.bar.tooltip) .. ")")
+check(typo.state["buienradar.error"] == "City 'Emmmen' not found", "the error text is published for the panel")
+local no_city = widget_for({ city = "  " })
+check(no_city.bar.tooltip == "Buienradar: No city set", "empty city name is reported")
+
+-- 2.3 coordinates mode
+local coords = widget_for({ location_mode = "coordinates", latitude = 52.78, longitude = 6.91 })
+check(coords.hosts["geocoding-api.open-meteo.com"] == nil and coords.hosts["ipwho.is"] == nil,
+  "coordinates mode needs no geocoder and no IP lookup")
+check(coords.state.buienradar.place.label == "52.78, 6.91" and coords.state.buienradar.place.geoid == nil,
+  "coordinates mode: the place is shown by its coordinates")
+check(request_to(coords, "gpsgadget"):find("lat=52.78&lon=6.91", 1, true) ~= nil, "coordinates mode: rain outlook for those coordinates")
+
+-- 2.4 automatic mode is an explicit opt-in
+check(emmen.hosts["ipwho.is"] == nil and any_country.hosts["ipwho.is"] == nil, "default mode never contacts the IP service")
+local auto_r, auto_e = widget_for({ location_mode = "auto" })
+check(auto_r.hosts["ipwho.is"] == 1 and auto_r.hosts["geocoding-api.open-meteo.com"] == 1, "auto mode: one IP lookup, then the geocoder")
+check(request_to(auto_r, "geocoding"):find("name=Amsterdam&", 1, true) ~= nil and request_to(auto_r, "geocoding"):find("countryCode=NL", 1, true) ~= nil,
+  "auto mode: the city and country from the IP lookup go to the geocoder")
+check(auto_r.state.buienradar.place.label == "Amsterdam, Noord-Holland" and auto_r.state.buienradar.place.geoid == 2759794,
+  "auto mode: the place is the detected city")
+check(tooltip_value(auto_r, "Place") == "Amsterdam, Noord-Holland", "the bar tooltip names the detected place")
+local auto_c = widget_for({ location_mode = "auto" }, nil)
+local coords_only = make_runtime(settings_with({ location_mode = "auto" }))
+coords_only.ip = "coordinates_only"
+load_widget(coords_only).update()
+check(coords_only.state.buienradar.place.label == "52.38, 4.90" and coords_only.hosts["geocoding-api.open-meteo.com"] == nil,
+  "auto mode with a coordinates-only answer: place shown by coordinates, no geocoder")
+check(request_to(coords_only, "gpsgadget"):find("lat=52.38&lon=4.90", 1, true) ~= nil, "auto mode: the outlook follows the IP coordinates")
+local ip_down = make_runtime(settings_with({ location_mode = "auto" }))
+ip_down.failing["ipwho.is"] = true
+load_widget(ip_down).update()
+check(ip_down.bar.tooltip == "Buienradar: IP lookup failed (500)" and ip_down.hosts["data.buienradar.nl"] == nil,
+  "auto mode: a failed IP lookup is reported and no other place is assumed (got " .. tostring(ip_down.bar.tooltip) .. ")")
+
+-- an IP place is reused for an hour, then looked up again
+auto_e.update()
+check(auto_r.hosts["ipwho.is"] == 1, "auto mode: no new IP lookup within the hour")
+auto_r.now = auto_r.now + 61 * 60 * 1000
+auto_e.update()
+check(auto_r.hosts["ipwho.is"] == 2, "auto mode: looked up again after an hour")
+
+-- 2.5 the place is cached for city mode
+local cache_r, cache_e = widget_for()
+cache_e.update()
+check(cache_r.hosts["geocoding-api.open-meteo.com"] == 1, "same settings: the geocoder is not asked again")
+cache_r.settings.city = "Groningen"
+local cache_e2 = load_widget(cache_r)
+cache_e2.update()
+check(cache_r.hosts["geocoding-api.open-meteo.com"] == 2 and cache_r.state.buienradar.place.name == "Groningen",
+  "a changed city is resolved once")
+cache_r.now = cache_r.now + 48 * 3600 * 1000
+cache_e2.update()
+check(cache_r.hosts["geocoding-api.open-meteo.com"] == 2, "a city place does not expire")
+
+-- 2.6 station, distance and rain outlook follow the place
+local gron = widget_for({ city = "Groningen" })
+check(request_to(gron, "gpsgadget"):find("lat=53.22&lon=6.57", 1, true) ~= nil, "Groningen: rain outlook for its coordinates")
+check(gron.state.buienradar.station == "Groningen" and gron.state.buienradar.station_km <= 12, "Groningen: the nearest station is its own, about 10 km out")
+local es = emmen.state.buienradar
+check(es.station == "Hoogeveen" and es.station_km >= 25 and es.station_km <= 28, "Emmen: Hoogeveen at about 26 km (got " .. tostring(es.station_km) .. ")")
+local pinned = widget_for({ station_id = 6280 }).state.buienradar
+check(pinned.station == "Groningen" and pinned.station_km > 40, "an explicit station id wins over the place")
+local berlin = widget_for({ city = "Berlin", country = "DE" }).state.buienradar
+check(berlin.place.cc == "DE" and berlin.station_km > 300, "far away: the distance is recorded (got " .. tostring(berlin.station_km) .. " km)")
+check(es.v == 2 and es.sig == "city|emmen|NL|s0" and plain_data(es), "the snapshot has its signature and only plain data")
+
+-- 3.1 failures and wrong-place protection
+local stale_r, stale_e = widget_for()
+stale_r.failing["data.buienradar.nl"] = true
+stale_e.update()
+check(stale_r.bar.text == "11°" and tooltip_value(stale_r, "Problem") == "Feed request failed (500)",
+  "same place, refresh fails: old data stays and the failure is named")
+check(tooltip_value(stale_r, "Updated"):find("(stale)", 1, true) ~= nil, "same place, refresh fails: the data is marked stale")
+check(stale_r.state["buienradar.error"] == "Feed request failed (500)", "the failure is published for the panel")
+stale_r.failing["data.buienradar.nl"] = nil
+stale_e.update()
+check(stale_r.state["buienradar.error"] == "" and tooltip_value(stale_r, "Problem") == nil, "a good refresh clears the failure")
+
+local wrong_r, wrong_e = widget_for()
+wrong_r.settings.city = "Emmmen"
+local wrong_e2 = load_widget(wrong_r)
+check(wrong_r.bar.text == "--", "after changing the city the old city's weather is not shown")
+wrong_e2.update()
+check(wrong_r.bar.text == "--" and wrong_r.bar.tooltip == "Buienradar: City 'Emmmen' not found",
+  "new city not found: placeholder and the reason, not the weather of the old city")
+local first_fail = make_runtime(settings_with())
+first_fail.failing["geocoding-api.open-meteo.com"] = true
+load_widget(first_fail).update()
+check(first_fail.bar.text == "--" and first_fail.bar.tooltip == "Buienradar: Geocoder request failed (500)",
+  "failure at the first refresh: placeholder and the reason")
+check(wrong_r.state["buienradar.sig"] == "city|emmmen|NL|s0", "the widget publishes the signature it is configured for")
+
+-- 4.1 bar text modes
+local function bar_for(extra, rain, mutate)
+  local r = make_runtime(settings_with(extra), rain)
+  local e = load_widget(r)
+  e.update()
+  if mutate then
+    local snap = r.state.buienradar
+    mutate(snap)
+    r.noctalia.state.set("buienradar", snap)
+  end
+  return r
+end
+check(bar_for({ bar_text = "temperature" }).bar.text == "11°", "bar text: temperature only")
+check(bar_for({ bar_text = "temperature_feels" }).bar.text == "11° (8°)", "bar text: temperature and feels-like")
+check(bar_for({ bar_text = "temperature_feels" }, nil, function(s) s.feels = nil end).bar.text == "11°",
+  "bar text: no feels-like available leaves the temperature only")
+check(bar_for({ bar_text = "temperature_rain" }).bar.text == "11° ☂", "bar text: rain now or soon adds the umbrella")
+check(bar_for({ bar_text = "temperature_rain" }, build_rain("15:30", 24)).bar.text == "11°", "bar text: dry outlook has no umbrella")
+check(bar_for({ bar_text = "temperature_rain" }, build_rain("15:30", 24, { [1] = 100 })).bar.text == "11° ☂",
+  "bar text: only the current step wet still adds the umbrella")
+check(bar_for({ bar_text = "temperature_rain" }, build_rain("15:30", 24, { [24] = 90 })).bar.text == "11° ☂",
+  "bar text: a wet step at the end of the 2 hours counts")
+check(bar_for({ bar_text = "temperature_rain" }, build_rain("15:30", 24, { [3] = 76 })).bar.text == "11°",
+  "bar text: raw 76 (below 0.1 mm/h) is not rain")
+local no_outlook = make_runtime(settings_with({ bar_text = "temperature_rain" }))
+no_outlook.failing["gpsgadget.buienradar.nl"] = true
+load_widget(no_outlook).update()
+check(no_outlook.bar.text == "11°" and no_outlook.state.buienradar.rain == nil, "bar text: outlook unavailable gives the temperature only")
+
+-- two bar widgets, two modes, one data set
+local two = make_runtime(settings_with())
+local second = { text = nil }
+local second_bar = { setText = function(t) second.text = t end, setGlyph = function() end, setTooltip = function() end }
+-- inside a widget noctalia.getConfig returns that widget's own value for widget-level settings
+local second_noctalia = setmetatable({
+  getConfig = function(k) if k == "bar_text" then return "temperature_rain" end return two.noctalia.getConfig(k) end,
+}, { __index = two.noctalia })
+load_entry("widget.luau", { noctalia = second_noctalia, barWidget = second_bar })
+load_widget(two).update()
+check(two.bar.text == "11°" and second.text == "11° ☂", "two bar widgets show their own text for the same data")
+
+-- wind units (tooltip row)
+local function wind_for(unit, mutate) return tooltip_value(bar_for({ wind_unit = unit }, nil, mutate), "Wind") end
+check(wind_for("bft") == "W 4 Bft", "wind: Beaufort (got " .. tostring(wind_for("bft")) .. ")")
+check(wind_for("ms") == "W 7.3 m/s", "wind: metres per second (got " .. tostring(wind_for("ms")) .. ")")
+check(wind_for("kmh") == "W 26 km/h", "wind: kilometres per hour (got " .. tostring(wind_for("kmh")) .. ")")
+check(wind_for("bogus") == "W 4 Bft", "wind: an unknown unit falls back to Beaufort")
+check(wind_for("kmh", function(s) s.wind_dir, s.wind_ms, s.wind_bft = nil, nil, nil end) == "-", "wind: not reported shows a dash")
+
+-- 4.2 snapshots from before the raw numbers existed still draw
+local legacy = {
+  station = "Hoogeveen", updated = "15:00", desc = "Zwaar bewolkt en regen", glyph = "cloud-rain",
+  temp_text = "11°", feels_text = "8°", wind_text = "W 4 Bft", humidity_text = "89%", pressure_text = "1008 hPa",
+  rain_hour_text = "3.3 mm", sunrise = "07:53", sunset = "18:54", days = {},
+}
+local old_r = make_runtime(settings_with({ bar_text = "temperature_feels", wind_unit = "kmh" }))
+old_r.state.buienradar = legacy
+load_widget(old_r)
+check(old_r.bar.text == "11° (8°)" and tooltip_value(old_r, "Wind") == "W 4 Bft", "an older snapshot draws from its text fields")
+
+-- 4.3 display settings apply without a request
+local live = make_runtime(settings_with())
+local live_e = load_widget(live)
+live_e.update()
+local live_requests = #live.requests
+live.settings.wind_unit = "kmh"
+live.settings.bar_text = "temperature_feels"
+load_widget(live)
+check(live.bar.text == "11° (8°)" and tooltip_value(live, "Wind") == "W 26 km/h" and #live.requests == live_requests,
+  "changed unit and bar text apply at once, with no request")
+
+---------------------------------------------------------------------------
 -- panel
 ---------------------------------------------------------------------------
 
@@ -247,17 +503,10 @@ check(#find_text(rendered, "Sun") >= 1 and #find_text(rendered, "Thu") >= 1, "fo
 penv.onCloseClicked()
 check(rendered == "closed", "close button closes the panel")
 
-rt.noctalia.getConfig = function(k) if k == "page_url" then return "https://example.test/emmen?a=1&b=2" end end
-penv.onOpenSiteClicked()
-check(type(rt.ran) == "table" and rt.ran[1] == "xdg-open" and rt.ran[2] == "https://example.test/emmen?a=1&b=2",
-  "link button runs xdg-open with the configured URL as a separate argv entry")
-rt.noctalia.getConfig = function(k) return nil end
-penv.onOpenSiteClicked()
-check(rt.ran[2] == "https://www.buienradar.nl", "link falls back to the default URL")
-
+local before_refresh = #rt.requests
 penv.onRefreshClicked()
-check(rt.state["buienradar.refresh"] == 1234, "refresh button publishes a refresh request")
-check(#rt.requests == 4, "widget refetches on a refresh request (requests: " .. #rt.requests .. ")")
+check(rt.state["buienradar.refresh"] == rt.now, "refresh button publishes a refresh request")
+check(#rt.requests == before_refresh + 2, "widget refetches feed and rain, not the place (new requests: " .. (#rt.requests - before_refresh) .. ")")
 
 ---------------------------------------------------------------------------
 -- rain scale, "now" marker and bar tooltips
@@ -398,6 +647,137 @@ local old_bars, old_scale
 if old_ok then old_bars, old_scale = find_chart(old_tree) end
 check(old_bars ~= nil and old_scale == nil, "old state: bars without a scale row")
 check(old_bars ~= nil and old_bars.children[1].props.tooltip == nil, "old state: bars without tooltips")
+
+---------------------------------------------------------------------------
+-- panel: place, wind units, link, wrong-place protection, errors
+---------------------------------------------------------------------------
+
+-- Opens the panel on a runtime; returns a function giving the tree drawn last.
+local function open_live(r)
+  local tree
+  local pe = load_entry("panel.luau", {
+    noctalia = r.noctalia,
+    ui = ui,
+    panel = { render = function(t) tree = t end, close = function() end },
+  })
+  pe.onOpen({})
+  return function() return tree end, pe
+end
+
+do -- 5.1 place and station
+  local tree = open_live(emmen)()
+  check(count_exact(tree, "Emmen, Drenthe · Station Hoogeveen") == 1, "panel names the place and the station (got "
+    .. tostring(find_text(tree, "Station")[1]) .. ")")
+  check(#find_text(tree, "km away") == 0, "a near station (27 km) comes without a distance")
+
+  local far_tree = open_live(widget_for({ city = "Berlin", country = "DE" }))()
+  local far_text = find_text(far_tree, "km away")[1]
+  check(far_text ~= nil and far_text:find("Berlijn, Deelstaat Berlijn", 1, true) ~= nil and far_text:match(", %d+ km away$") ~= nil,
+    "a far station is shown with its distance (got " .. tostring(far_text) .. ")")
+end
+
+do -- 5.2 wind units: the same cases through the widget tooltip and the panel
+  local cases = {
+    { unit = "bft", ms = 7.3, bft = 4, dir = "W", text = "W 4 Bft" },
+    { unit = "ms", ms = 7.3, bft = 4, dir = "W", text = "W 7.3 m/s" },
+    { unit = "kmh", ms = 7.3, bft = 4, dir = "W", text = "W 26 km/h" },
+    { unit = "kmh", ms = 0, bft = 0, dir = "ZW", text = "SW 0 km/h" },
+    { unit = "ms", ms = 12.5, bft = 6, dir = "OZO", text = "ESE 12.5 m/s" },
+    { unit = "bft", ms = nil, bft = nil, dir = "W", text = "W -" },
+    { unit = "kmh", ms = nil, bft = nil, dir = nil, text = "-" },
+    { unit = "ms", ms = 7.3, bft = 4, dir = nil, text = "7.3 m/s" },
+  }
+  local agree = true
+  for _, c in ipairs(cases) do
+    local r = make_runtime(settings_with({ wind_unit = c.unit }))
+    load_widget(r)
+    local snap = copy(emmen.state.buienradar)
+    snap.wind_ms, snap.wind_bft, snap.wind_dir = c.ms, c.bft, c.dir
+    r.noctalia.state.set("buienradar", snap)
+    local bar_side = tooltip_value(r, "Wind")
+    local panel_side = count_exact(open_live(r)(), c.text)
+    if bar_side ~= c.text or panel_side < 1 then
+      agree = false
+      print("      wind case " .. c.unit .. ": bar=" .. tostring(bar_side) .. " panel hits=" .. panel_side .. " wanted " .. c.text)
+    end
+  end
+  check(agree, "bar tooltip and panel format the wind identically in all " .. #cases .. " cases")
+
+  local switched = make_runtime(settings_with({ wind_unit = "bft" }))
+  load_widget(switched)
+  switched.noctalia.state.set("buienradar", copy(emmen.state.buienradar))
+  local get_tree = open_live(switched)
+  switched.settings.wind_unit = "kmh"
+  local live_tree = open_live(switched)()
+  check(count_exact(live_tree, "W 26 km/h") >= 1, "a panel opened after switching the unit shows the new unit")
+end
+
+do -- 4.2 (panel) snapshots from before the raw numbers existed
+  local tree = open_live(old_r)()
+  check(tree ~= nil and count_exact(tree, "W 4 Bft") >= 1 and count_exact(tree, "11°") >= 1 and #find_text(tree, "Station Hoogeveen") >= 1,
+    "an older snapshot is drawn from its text fields, without a place")
+end
+
+do -- 5.3 link to buienradar.nl
+  local function link(extra, rain, mutate)
+    local r = make_runtime(settings_with(extra), rain)
+    load_widget(r).update()
+    if mutate then mutate(r) end
+    local _, pe = open_live(r)
+    pe.onOpenSiteClicked()
+    return r.ran
+  end
+  local default = link()
+  check(type(default) == "table" and #default == 2 and default[1] == "xdg-open"
+      and default[2] == "https://www.buienradar.nl/weer/emmen/nl/2756136?radarType=rain&radarLocationVariant=NL&radarOffset=8H",
+    "default link for Emmen, as one argument of xdg-open (got " .. tostring(default and default[2]) .. ")")
+  check(link({ city = "'s-Hertogenbosch" })[2]:find("^https://www%.buienradar%.nl/weer/s%-hertogenbosch/nl/2747351%?") ~= nil,
+    "an apostrophe in the name becomes a clean path segment")
+  check(link({ page_query = "" })[2] == "https://www.buienradar.nl/weer/emmen/nl/2756136", "empty parameters: plain city page, no '?'")
+  check(link({ page_url = "https://example.test/emmen?a=1&b=2" })[2] == "https://example.test/emmen?a=1&b=2",
+    "a full URL overrides everything")
+  check(link({ location_mode = "coordinates" })[2] == "https://www.buienradar.nl", "coordinates mode opens the home page")
+  local coords_only = make_runtime(settings_with({ location_mode = "auto" }))
+  coords_only.ip = "coordinates_only"
+  load_widget(coords_only).update()
+  local _, coords_pe = open_live(coords_only)
+  coords_pe.onOpenSiteClicked()
+  check(coords_only.ran[2] == "https://www.buienradar.nl", "an IP place without a city opens the home page")
+  check(link({ location_mode = "auto" })[2]:find("/weer/amsterdam/nl/2759794", 1, true) ~= nil, "an IP place with a city gets the city page")
+  check(link({ page_query = "x=1&y=2" })[2]:sub(-8) == "?x=1&y=2", "the link parameters come from the setting")
+  local no_data = make_runtime(settings_with())
+  load_widget(no_data)
+  local _, nd_pe = open_live(no_data)
+  nd_pe.onOpenSiteClicked()
+  check(no_data.ran[2] == "https://www.buienradar.nl", "without data the link opens the home page")
+end
+
+do -- 5.4 wrong-place protection and errors
+  local r = widget_for()
+  r.settings.city = "Groningen"
+  load_widget(r) -- the setting changed: the widget publishes the new signature
+  local tree = open_live(r)()
+  check(count_exact(tree, "Waiting for Buienradar...") == 1 and #find_text(tree, "Hoogeveen") == 0,
+    "a snapshot for another city is not shown, the panel waits")
+
+  r.settings.city = "Emmmen"
+  local e = load_widget(r)
+  local get_tree = open_live(r)
+  e.update()
+  check(count_exact(get_tree(), "City 'Emmmen' not found") == 1 and count_exact(get_tree(), "Waiting for Buienradar...") == 1,
+    "the waiting panel redraws itself with the reason when the lookup fails")
+
+  local s = widget_for()
+  s.failing["data.buienradar.nl"] = true
+  local live, _ = open_live(s)
+  local s_e = load_widget(s)
+  s_e.update()
+  check(count_exact(live(), "Feed request failed (500)") == 1 and count_exact(live(), "Updated 15:10 (stale)") == 1,
+    "same place, refresh failed: the data stays, marked stale, with the reason")
+  s.failing["data.buienradar.nl"] = nil
+  s_e.update()
+  check(#find_text(live(), "stale") == 0 and #find_text(live(), "Feed request failed") == 0, "after a good refresh the error is gone")
+end
 
 -- empty state
 local rt5 = make_runtime({})

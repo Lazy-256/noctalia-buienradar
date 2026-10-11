@@ -1,6 +1,6 @@
 id          = "lazy/buienradar"
 name        = "Buienradar"
-version     = "0.1.0"
+version     = "0.2.0"
 plugin_api  = 32
 author      = "lazy"
 license     = "MIT"
@@ -9,14 +9,34 @@ description = "Current weather, 5-day forecast and 2-hour rain outlook from Buie
 tags        = ["weather", "netherlands", "buienradar"]
 
 # Plugin-level settings: shared by the bar widget and the panel.
+
 [[setting]]
-key             = "station_id"
-type            = "int"
-label_key       = "settings.station_id.label"
-description_key = "settings.station_id.description"
-default         = 0
-min             = 0
-max             = 99999
+key             = "location_mode"
+type            = "select"
+label_key       = "settings.location_mode.label"
+description_key = "settings.location_mode.description"
+default         = "city"
+options = [
+  { value = "city",        label_key = "settings.location_mode.option.city" },
+  { value = "auto",        label_key = "settings.location_mode.option.auto" },
+  { value = "coordinates", label_key = "settings.location_mode.option.coordinates" },
+]
+
+[[setting]]
+key             = "city"
+type            = "string"
+label_key       = "settings.city.label"
+description_key = "settings.city.description"
+default         = "Emmen"
+visible_when    = { key = "location_mode", values = ["city"] }
+
+[[setting]]
+key             = "country"
+type            = "string"
+label_key       = "settings.country.label"
+description_key = "settings.country.description"
+default         = "NL"
+visible_when    = { key = "location_mode", values = ["city"] }
 
 [[setting]]
 key             = "latitude"
@@ -26,6 +46,7 @@ description_key = "settings.latitude.description"
 default         = 52.7792
 min             = -90.0
 max             = 90.0
+visible_when    = { key = "location_mode", values = ["coordinates"] }
 
 [[setting]]
 key             = "longitude"
@@ -35,13 +56,32 @@ description_key = "settings.longitude.description"
 default         = 6.9006
 min             = -180.0
 max             = 180.0
+visible_when    = { key = "location_mode", values = ["coordinates"] }
+
+[[setting]]
+key             = "station_id"
+type            = "int"
+label_key       = "settings.station_id.label"
+description_key = "settings.station_id.description"
+default         = 0
+min             = 0
+max             = 99999
+advanced        = true
+
+[[setting]]
+key             = "page_query"
+type            = "string"
+label_key       = "settings.page_query.label"
+description_key = "settings.page_query.description"
+default         = "radarType=rain&radarLocationVariant=NL&radarOffset=8H"
 
 [[setting]]
 key             = "page_url"
 type            = "string"
 label_key       = "settings.page_url.label"
 description_key = "settings.page_url.description"
-default         = "https://www.buienradar.nl/weer/emmen/nl/2756136?radarType=rain&radarLocationVariant=NL&radarOffset=8H"
+default         = ""
+advanced        = true
 
 [[setting]]
 key             = "refresh_minutes"
@@ -52,15 +92,40 @@ default         = 10
 min             = 5
 max             = 60
 
+[[setting]]
+key             = "wind_unit"
+type            = "select"
+label_key       = "settings.wind_unit.label"
+description_key = "settings.wind_unit.description"
+default         = "bft"
+options = [
+  { value = "bft", label_key = "settings.wind_unit.option.bft" },
+  { value = "ms",  label_key = "settings.wind_unit.option.ms" },
+  { value = "kmh", label_key = "settings.wind_unit.option.kmh" },
+]
+
 [[widget]]
 id    = "weather"
 entry = "widget.luau"
+
+# Widget-level setting: every bar widget can show its own text.
+[[widget.setting]]
+key             = "bar_text"
+type            = "select"
+label_key       = "settings.bar_text.label"
+description_key = "settings.bar_text.description"
+default         = "temperature"
+options = [
+  { value = "temperature",       label_key = "settings.bar_text.option.temperature" },
+  { value = "temperature_feels", label_key = "settings.bar_text.option.temperature_feels" },
+  { value = "temperature_rain",  label_key = "settings.bar_text.option.temperature_rain" },
+]
 
 [[panel]]
 id                      = "forecast"
 entry                   = "panel.luau"
 width                   = 380
-height                  = 550
+height                  = 580
 placement               = "floating"
 open_near_click         = true
 dismiss_on_outside_click = true
