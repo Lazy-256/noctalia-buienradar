@@ -208,14 +208,25 @@ local function build_snapshot(body, id, lat, lon)
 end
 
 -- Body: "087|15:25\r\n..." (raw value, 5-minute steps, ~2 hours).
+--
+-- Besides the 0..1 bar heights this returns what the panel needs for the
+-- half-hour scale and the bar tooltips:
+--   ticks = { { index = <1-based bar>, label = "HH:MM" }, ... }  at every :00 / :30
+--   tips  = { "15:25 - 0.2 mm/h" | "15:30 - dry", ... }          one per bar
 local function parse_rain(body)
-  local values, times, wet = {}, {}, {}
+  local values, times, wet, ticks, tips = {}, {}, {}, {}, {}
   for raw, time in tostring(body):gmatch("(%d+)|(%d%d:%d%d)") do
     local v = tonumber(raw)
     local mm = v > 0 and 10 ^ ((v - 109) / 32) or 0
+    local is_wet = v >= WET_THRESHOLD
     values[#values + 1] = math.min(1, math.sqrt(mm / 5))
     times[#times + 1] = time
-    wet[#wet + 1] = v >= WET_THRESHOLD
+    wet[#wet + 1] = is_wet
+    tips[#tips + 1] = time .. " - " .. (is_wet and string.format("%.1f mm/h", mm) or "dry")
+    local minute = time:sub(4, 5)
+    if minute == "00" or minute == "30" then
+      ticks[#ticks + 1] = { index = #values, label = time }
+    end
   end
   if #values == 0 then return nil end
 
@@ -236,7 +247,14 @@ local function parse_rain(body)
     note = "Rain from " .. times[first_wet]
   end
 
-  return { values = values, start = times[1], stop = times[#times], note = note }
+  return {
+    values = values,
+    start = times[1],
+    stop = times[#times],
+    note = note,
+    ticks = ticks,
+    tips = tips,
+  }
 end
 
 ---------------------------------------------------------------------------

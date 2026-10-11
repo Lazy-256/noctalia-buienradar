@@ -4,6 +4,10 @@ A [Noctalia](https://noctalia.dev) (v5) plugin that shows weather from
 [Buienradar.nl](https://www.buienradar.nl): a bar widget with glyph and temperature, and a
 forecast panel with current conditions, a 2-hour rain outlook and a 5-day forecast.
 
+The rain outlook is a row of bars, one per 5 minutes, with a half-hour scale underneath
+(a tick and an `HH:MM` label at every :00 and :30, and `now` at the left edge when there is room).
+Hover a bar to see its time and intensity, e.g. `15:25 - 0.2 mm/h` (below 0.1 mm/h: `dry`).
+
 - `plugin.toml` - manifest and settings
 - `widget.luau` - bar widget; fetches the data and publishes it to plugin state
 - `panel.luau` - forecast panel; renders the published state
@@ -69,6 +73,8 @@ noctalia msg panel-toggle lazy/buienradar:forecast
 - `plugin_api = 32` (Noctalia 5.2.0+): with a lower level `ui.box` was nil inside the panel
   (`call to 'onOpen' failed ... attempt to call a nil value`), and `tooltip` on rows needs 32 anyway.
 - The rain outlook is drawn with `ui.box` bars: `ui.graph` did not show the values as expected.
+- The scale under the bars is a row of cells weighted by the number of bars they cover, so it needs no pixel
+  maths; a tick label is only printed when at least three bars remain to the right edge (otherwise just the tick).
 - Changes to `plugin.toml` (panel size, api level) are only picked up after
   `noctalia msg plugins disable lazy/buienradar && noctalia msg plugins enable lazy/buienradar`;
   `.luau` edits hot-reload.
